@@ -1,3 +1,5 @@
 # ninja log v7
 0	37171	1781527982568085268	/home/ubuntu/vllm_custom_plugins/build/temp.linux-x86_64-3.10/csrc/registration.o	66850d9ac4e1476a
 0	71714	1781527982568085268	/home/ubuntu/vllm_custom_plugins/build/temp.linux-x86_64-3.10/csrc/fused_activation.o	b148a741c6c31d2c
+16	36473	1781529829062966746	/home/ubuntu/vllm_custom_plugins/build/temp.linux-x86_64-3.10/csrc/registration.o	66850d9ac4e1476a
+15	69659	1781529829062966746	/home/ubuntu/vllm_custom_plugins/build/temp.linux-x86_64-3.10/csrc/fused_activation.o	b148a741c6c31d2c
