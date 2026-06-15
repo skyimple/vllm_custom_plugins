@@ -142,3 +142,142 @@ void launch_paged_attention(
         num_heads, head_size, block_size, max_blocks_per_seq
     );
 }
+
+
+// PagedAttention
+
+// 真实的工业级 PagedAttention 联合编译核函数
+// 每个 Thread Block 承包 [一个 Batch, 一个 Head] 的全套 Attention 计算（Q * K -> Softmax -> Attn * V）
+__global__ void paged_attention_v1_kernel(
+    float* __restrict__ out,                 // 最终输出的上下文向量: [BatchSize, NumHeads, HeadSize]
+    const float* __restrict__ q,             // Query 张量: [BatchSize, NumHeads, HeadSize]
+    const float* __restrict__ k_buffer,      // Key 显存池: [NumBlocks, BlockSize, NumHeads, HeadSize]
+    const float* __restrict__ v_buffer,      // Value 显存池: [NumBlocks, BlockSize, NumHeads, HeadSize]
+    const int* __restrict__ block_table,     // 路由表: [BatchSize, MaxBlocksPerSeq]
+    const int* __restrict__ context_lens,    // 真实长度: [BatchSize]
+    int num_heads,
+    int head_size,
+    int block_size,
+    int max_blocks_per_seq) {
+
+    // 1. 建立 2D 硬件映射
+    int seq_idx = blockIdx.x;   // 当前处理哪个句子 (Batch 维度)
+    int head_idx = blockIdx.y;  // 当前处理哪个 Head (Head 维度)
+    int tid = threadIdx.x;      // 块内线程 ID (0 ~ 127)
+
+    int current_len = context_lens[seq_idx];
+    if (current_len == 0) return;
+
+    // 🚨 申请片上高速共享内存（Shared Memory）作为临时账本，用来存放所有历史 Token 的原始得分
+    // 最大支持单句 128 个历史 Token
+    __shared__ float shared_scores[128];
+    
+    // 定位当前的 Query 向量起始地址
+    const float* q_ptr = q + seq_idx * (num_heads * head_size) + head_idx * head_size;
+
+    // ==========================================
+    // 阶段一：并行计算 Q * K，阻击显存断层
+    // ==========================================
+    // 每个线程可能需要处理多个历史 Token（以 stride = 128 步进）
+    for (int token_idx = tid; token_idx < current_len; token_idx += 128) {
+        // 跨界物理寻址
+        int logical_block_idx = token_idx / block_size;
+        int block_slot_idx = token_idx % block_size;
+        int physical_block_id = block_table[seq_idx * max_blocks_per_seq + logical_block_idx];
+
+        // 锁定对应的 Key 向量首地址
+        const float* k_ptr = k_buffer + 
+                             physical_block_id * (block_size * num_heads * head_size) +
+                             block_slot_idx * (num_heads * head_size) +
+                             head_idx * head_size;
+
+        // 计算点积 Q * K
+        float score = 0.0f;
+        for (int d = 0; d < head_size; ++d) {
+            score += q_ptr[d] * k_ptr[d];
+        }
+        // 加上缩放因子 1 / sqrt(head_size)
+        shared_scores[token_idx] = score / sqrtf(head_size);
+    }
+
+    // ⚡ 硬件级同步：必须等待 128 个线程全部把得分写进共享内存，才能做后续的 Softmax！
+    __syncthreads();
+
+    // ==========================================
+    // 阶段二：片上全局高精度在线 Softmax
+    // ==========================================
+    // 为了防止浮点数溢出，先找出最大值 Max
+    __shared__ float max_val;
+    if (tid == 0) {
+        float tmp_max = -1e20f;
+        for (int i = 0; i < current_len; ++i) {
+            if (shared_scores[i] > tmp_max) tmp_max = shared_scores[i];
+        }
+        max_val = tmp_max;
+    }
+    __syncthreads();
+
+    // 每个线程并行计算 exp(x - max)，并累加求和分母
+    __shared__ float exp_sum;
+    if (tid == 0) {
+        float tmp_sum = 0.0f;
+        for (int i = 0; i < current_len; ++i) {
+            shared_scores[i] = expf(shared_scores[i] - max_val);
+            tmp_sum += shared_scores[i];
+        }
+        exp_sum = tmp_sum;
+    }
+    __syncthreads();
+
+    // 归一化，把 shared_scores 彻底变成概率权重
+    for (int token_idx = tid; token_idx < current_len; token_idx += 128) {
+        shared_scores[token_idx] /= exp_sum;
+    }
+    __syncthreads();
+
+    // ==========================================
+    // 阶段三：加权求和，乘以非连续的 Value Cache
+    // ==========================================
+    // 每个线程负责当前 Head 的一个特定维度（head_size 通常为 64 或 128）
+    if (tid < head_size) {
+        float res = 0.0f;
+        for (int token_idx = 0; token_idx < current_len; ++token_idx) {
+            // 再次物理查表，定位非连续的 Value 显存块
+            int logical_block_idx = token_idx / block_size;
+            int block_slot_idx = token_idx % block_size;
+            int physical_block_id = block_table[seq_idx * max_blocks_per_seq + logical_block_idx];
+
+            const float* v_ptr = v_buffer + 
+                                 physical_block_id * (block_size * num_heads * head_size) +
+                                 block_slot_idx * (num_heads * head_size) +
+                                 head_idx * head_size;
+
+            // 概率权重 * Value 对应的维度值
+            res += shared_scores[token_idx] * v_ptr[tid];
+        }
+
+        // 把最终进化出的 Context Vector 写回输出显存
+        out[seq_idx * (num_heads * head_size) + head_idx * head_size + tid] = res;
+    }
+}
+
+// C++ 转发层包装
+void launch_paged_attention_v1(
+    at::Tensor& q, at::Tensor& k_buffer, at::Tensor& v_buffer, 
+    at::Tensor& block_table, at::Tensor& context_lens, at::Tensor& out, int block_size) {
+    
+    int batch_size = q.size(0);
+    int num_heads = q.size(1);
+    int max_blocks_per_seq = block_table.size(1);
+    
+    // Grid 调度：X轴处理句子，Y轴处理 Head
+    dim3 grid(batch_size, num_heads);
+    dim3 block(128); // 启动 128 个线程常驻片上
+    
+    paged_attention_v1_kernel<<<grid, block>>>(
+        out.data_ptr<float>(), q.data_ptr<float>(), 
+        k_buffer.data_ptr<float>(), v_buffer.data_ptr<float>(),
+        block_table.data_ptr<int>(), context_lens.data_ptr<int>(),
+        num_heads, q.size(2), block_size, max_blocks_per_seq
+    );
+}

@@ -24,3 +24,15 @@ def paged_attention(q: torch.Tensor, k_buffer: torch.Tensor, block_table: torch.
     # 跨界调用二进制核心
     custom_ops.paged_attention(q, k_buffer, block_table, context_lens, out_scores, block_size)
     return out_scores
+
+# v1 pagedattention
+def paged_attention_v1(q: torch.Tensor, k_buffer: torch.Tensor, v_buffer: torch.Tensor, block_table: torch.Tensor, context_lens: torch.Tensor, block_size: int = 4) -> torch.Tensor:
+    batch_size = q.size(0)
+    num_heads = q.size(1)
+    head_size = q.size(2)
+    
+    # 🚨 真实输出：不再是中间得分，而是直接吐出 [Batch, Head, Dimension] 的最终注意力上下文向量！
+    out = torch.zeros(batch_size, num_heads, head_size, device="cuda", dtype=torch.float32)
+    
+    custom_ops.paged_attention_v1(q, k_buffer, v_buffer, block_table, context_lens, out, block_size)
+    return out
