@@ -40,17 +40,17 @@ cuda_out = paged_attention_v1(q, manager.k_buffer, manager.v_buffer, block_table
 torch_outputs = []
 for i in range(batch_size):
     c_len = context_lens[i].item()
-    # [1, num_heads, head_size]
-    qi = q[i].unsqueeze(0) 
+    # [1, num_heads, 1, head_size] — 增加 token 维度，确保 4D @ 4D 正确广播
+    qi = q[i].unsqueeze(0).unsqueeze(-2)
     # [1, c_len, num_heads, head_size] -> transpose -> [1, num_heads, c_len, head_size]
     ki = raw_k_seq[i].unsqueeze(0).transpose(1, 2)
     vi = raw_v_seq[i].unsqueeze(0).transpose(1, 2)
-    
+
     # 算原生 Attention
     scores = torch.matmul(qi, ki.transpose(-2, -1)) / math.sqrt(head_size)
     probs = torch.softmax(scores, dim=-1)
-    context_i = torch.matmul(probs, vi) # [1, num_heads, head_size]
-    torch_outputs.append(context_i.squeeze(0))
+    context_i = torch.matmul(probs, vi) # [1, num_heads, 1, head_size]
+    torch_outputs.append(context_i.squeeze(-2).squeeze(0))
 
 torch_out = torch.stack(torch_outputs, dim=0)
 
